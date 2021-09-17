@@ -7,6 +7,7 @@ import requests
 import singer
 import singer.bookmarks as bookmarks
 import singer.metrics as metrics
+import re
 
 from singer import metadata
 
@@ -72,6 +73,12 @@ class ConflictError(GithubException):
     pass
 
 class RateLimitExceeded(GithubException):
+    pass
+
+class PaginationLimitExceeded(GithubException):
+    pass
+
+class HttpException(Exception):
     pass
 
 ERROR_CODE_EXCEPTION_MAPPING = {
@@ -200,23 +207,51 @@ def rate_throttling(response):
 
 # pylint: disable=dangerous-default-value
 def authed_get(source, url, headers={}):
-    with metrics.http_request_timer(source) as timer:
-        session.headers.update(headers)
-        resp = session.request(method='get', url=url)
-        if resp.status_code != 200:
-            raise_for_error(resp, source)
-        timer.tags[metrics.Tag.http_status_code] = resp.status_code
-        rate_throttling(resp)
-        return resp
+    for _ in range(0, 3): # 3 attempts
+        with metrics.http_request_timer(source) as timer:
+            session.headers.update(headers)
+            resp = session.request(method='get', url=url)
+
+            # Handle github's rate limited responses
+            remaining = resp.headers.get('X-RateLimit-Remaining')
+            time_to_reset = resp.headers.get('X-RateLimit-Reset', time.time() + 60)
+            if remaining is not None and remaining == '0':
+                time.sleep(float(time_to_reset) - time.time())
+                continue  # next attempt
+
+            # Handle github's possible failures as retries
+            if resp.status_code == 502 or resp.status_code == 503:
+                continue  # next attempt
+
+            # Handle 422 when reached github API pagination limit
+            if resp.status_code == 422 and re.match("pagination is limited for this resource.", resp.text):
+                raise PaginationLimitExceeded(resp.text)
+
+            if resp.status_code != 200:
+                raise_for_error(resp, source)
+            timer.tags[metrics.Tag.http_status_code] = resp.status_code
+            rate_throttling(resp)
+            return resp
+
+    raise HttpException(resp.text)
 
 def authed_get_all_pages(source, url, headers={}):
+    last_url = None
     while True:
-        r = authed_get(source, url, headers)
+        try:
+            r = authed_get(source, url, headers)
+        except PaginationLimitExceeded:
+            logger.info("API pagination limit exceeded for source %s.", source)
+            break
+
         yield r
+        if 'last' in r.links:
+            last_url = r.links['last']['url']
         if 'next' in r.links:
             url = r.links['next']['url']
         else:
             break
+
 
 def get_abs_path(path):
     return os.path.join(os.path.dirname(os.path.realpath(__file__)), path)
