@@ -625,9 +625,18 @@ def get_all_projects(schemas, repo_path, state, mdata, start_date):
 
     with metrics.record_counter('projects') as counter:
         #pylint: disable=too-many-nested-blocks
+        is_organization = False if re.search(r"\/", repo_path) else True
+        if is_organization:
+            # Is an organization
+            api_endpoint_url = 'https://api.github.com/orgs/{}/projects?sort=created_at&direction=desc'.format(repo_path)
+        else:
+            # Is a repository
+            api_endpoint_url = 'https://api.github.com/repos/{}/projects?sort=created_at&direction=desc'.format(repo_path)
+
+
         for response in authed_get_all_pages(
                 'projects',
-                'https://api.github.com/repos/{}/projects?sort=created_at&direction=desc'.format(repo_path),
+                api_endpoint_url,
                 { 'Accept': 'application/vnd.github.inertia-preview+json' }
         ):
             projects = response.json()
@@ -1085,11 +1094,18 @@ def do_sync(config, state, catalog):
 
     #pylint: disable=too-many-nested-blocks
     for repo in repositories:
-        logger.info("Starting sync of repository: %s", repo)
+        is_organization = False if re.search(r"\/", repo) else True
+        if is_organization:
+            logger.info("Starting sync of organization: %s", repo)
+        else:
+            logger.info("Starting sync of repository: %s", repo)
         for stream in catalog['streams']:
             stream_id = stream['tap_stream_id']
             stream_schema = stream['schema']
             mdata = stream['metadata']
+
+            if is_organization and stream_id != "projects":
+                continue
 
             # if it is a "sub_stream", it will be sync'd by its parent
             if not SYNC_FUNCTIONS.get(stream_id):
